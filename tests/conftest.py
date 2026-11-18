@@ -16,6 +16,7 @@ from app.config import Settings
 from app.models import load_manifest
 
 MODEL_BYTES = 296
+CANDIDATE_VERSION = "1.1.0-rc1"
 
 
 def write_model(model_dir: Path, model_id: str, *, weights_bytes: int = MODEL_BYTES) -> None:
@@ -54,6 +55,58 @@ def write_model(model_dir: Path, model_id: str, *, weights_bytes: int = MODEL_BY
     )
     assert declared == weights_bytes, "test fixture assumes 296-byte weights"
     (model_dir / f"{model_id}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def write_candidate(
+    candidate_dir: Path,
+    model_id: str,
+    *,
+    version: str = CANDIDATE_VERSION,
+    coefficients: list[float] | None = None,
+    intercept: float = -1.0,
+    threshold: float = 0.5,
+    file_name: str | None = None,
+    declared_bytes: int = MODEL_BYTES,
+) -> str:
+    """Write one candidate weight file and return its plain file name."""
+
+    n_features = 12
+    file_name = file_name or f"{model_id}-{version}.json"
+    payload = {
+        "model_id": model_id,
+        "name": f"{model_id.title()} Candidate",
+        "device_type": model_id,
+        "version": version,
+        "description": f"candidate model {model_id} {version}",
+        "features": [
+            "vibration_mean",
+            "vibration_rms",
+            "vibration_peak",
+            "vibration_std",
+            "vibration_crest",
+            "vibration_kurtosis",
+            "current_mean",
+            "current_rms",
+            "current_peak",
+            "current_std",
+            "current_crest",
+            "current_kurtosis",
+        ],
+        "feature_mean": [0.0] * n_features,
+        "feature_scale": [1.0] * n_features,
+        "coefficients": coefficients if coefficients is not None else [0.2] * n_features,
+        "intercept": intercept,
+        "decision_threshold": threshold,
+    }
+    actual = int(
+        np.asarray(payload["coefficients"], dtype=np.float64).nbytes
+        + np.asarray(payload["feature_mean"], dtype=np.float64).nbytes
+        + np.asarray(payload["feature_scale"], dtype=np.float64).nbytes
+        + np.asarray(payload["intercept"], dtype=np.float64).nbytes
+    )
+    assert actual == declared_bytes
+    (candidate_dir / file_name).write_text(json.dumps(payload), encoding="utf-8")
+    return file_name
 
 
 @pytest.fixture
@@ -101,8 +154,30 @@ def manifest(model_dir: Path):
 
 
 @pytest.fixture
-def settings(model_dir: Path) -> Settings:
-    return make_settings(model_dir)
+def candidate_dir(tmp_path: Path) -> Path:
+    directory = tmp_path / "candidate_models"
+    directory.mkdir()
+    entries = []
+    for model_id in ["alpha", "beta", "gamma"]:
+        file_name = write_candidate(directory, model_id)
+        entries.append(
+            {
+                "model_id": model_id,
+                "version": CANDIDATE_VERSION,
+                "file": file_name,
+                "weights_bytes": MODEL_BYTES,
+            }
+        )
+    manifest_payload = {"schema_version": 1, "candidates": entries}
+    (directory / "candidate_manifest.json").write_text(
+        json.dumps(manifest_payload), encoding="utf-8"
+    )
+    return directory
+
+
+@pytest.fixture
+def settings(model_dir: Path, candidate_dir: Path) -> Settings:
+    return make_settings(model_dir, candidate_model_dir=candidate_dir)
 
 
 @pytest_asyncio.fixture
@@ -117,6 +192,7 @@ async def client(settings: Settings, manifest) -> AsyncIterator[AsyncClient]:
 def make_settings(model_dir: Path, **overrides) -> Settings:
     values = {
         "model_dir": model_dir,
+        "candidate_model_dir": model_dir.parent / "candidate_models",
         "model_budget_bytes": 2048,
         "inference_delay_ms": 0,
         "model_load_delay_ms": 0,

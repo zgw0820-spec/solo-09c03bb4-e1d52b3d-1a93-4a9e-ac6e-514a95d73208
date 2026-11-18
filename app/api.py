@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from .cache import ModelCache, ModelLease
+from .candidates import CandidateCatalog, load_candidate_catalog
 from .config import ConfigurationError, Settings, load_settings
 from .errors import (
     InferenceError,
@@ -23,6 +24,7 @@ from .errors import (
     ModelCacheError,
     ModelLoadError,
     ModelTooLargeError,
+    UnknownCandidateError,
     UnknownModelError,
 )
 from .features import FEATURE_NAMES, extract_features
@@ -78,6 +80,34 @@ class MeasurementRequest(BaseModel):
         return values
 
 
+class CompareRequest(MeasurementRequest):
+    """Same measurement window plus the candidate version to compare against."""
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "model_id": "pump",
+                    "candidate_version": "1.1.0-rc1",
+                    "vibration": [2.1, -1.9, 3.4, -3.0, 2.5, -2.2],
+                    "current": [12.4, 12.8, 11.9, 12.6, 12.1, 12.9],
+                }
+            ]
+        }
+    }
+
+    candidate_version: str = Field(
+        ...,
+        description=(
+            "Candidate weight version published in the candidate directory "
+            "(candidate_manifest.json); never used by POST /v1/infer"
+        ),
+        examples=["1.1.0-rc1"],
+        min_length=1,
+        max_length=64,
+    )
+
+
 class InferenceResponse(BaseModel):
     model_id: str
     model_name: str
@@ -103,6 +133,36 @@ class ModelListResponse(BaseModel):
     models: list[ModelInfo]
 
 
+class VersionScore(BaseModel):
+    """Score and anomaly verdict for one weight version of one device model."""
+
+    model_version: str
+    anomaly_score: float = Field(..., ge=0.0, le=1.0)
+    is_anomaly: bool
+    decision_threshold: float
+
+
+class ComparisonResponse(BaseModel):
+    """Side-by-side verdict for the current weights and one candidate version."""
+
+    model_id: str
+    model_name: str
+    current: VersionScore
+    candidate: VersionScore
+    score_difference: float = Field(
+        ...,
+        description="candidate anomaly_score minus current anomaly_score",
+    )
+    decision_changed: bool = Field(
+        ...,
+        description="whether the anomaly verdict differs between the two versions",
+    )
+    features: dict[str, float] = Field(
+        default_factory=dict,
+        description="Single feature vector extracted from the shared measurement window",
+    )
+
+
 class CacheSnapshot(BaseModel):
     budget_bytes: int
     resident_bytes: int
@@ -126,6 +186,16 @@ def _cache_error_response(exc: ModelCacheError) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content=_error_payload(exc.code, str(exc), model_id=exc.model_id),
+        )
+    if isinstance(exc, UnknownCandidateError):
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=_error_payload(
+                exc.code,
+                str(exc),
+                model_id=exc.model_id,
+                candidate_version=exc.candidate_version,
+            ),
         )
     if isinstance(exc, ModelBusyError):
         headers["Retry-After"] = "1"
@@ -176,17 +246,22 @@ async def _wait_for_disconnect(request: Request) -> None:
 
 
 async def _acquire_lease(
-    cache: ModelCache, model_id: str, request: Request
+    cache: ModelCache,
+    label: str,
+    acquire: Callable[[], Awaitable[ModelLease]],
+    request: Request,
 ) -> ModelLease | None:
     """Acquire a lease, giving up cleanly if the client goes away first.
 
-    The load runs in the cache's own task.  Cancelling ``acquire_task`` only
-    removes this waiter; the shared load continues for every other request.
+    ``acquire`` builds the cache acquisition coroutine (production model or
+    candidate version).  The load runs in the cache's own task.  Cancelling
+    ``acquire_task`` only removes this waiter; the shared load continues for
+    every other request.
     """
 
-    acquire_task = asyncio.create_task(cache.acquire(model_id), name=f"acquire:{model_id}")
+    acquire_task = asyncio.create_task(acquire(), name=f"acquire:{label}")
     disconnect_task = asyncio.create_task(
-        _wait_for_disconnect(request), name=f"disconnect:{model_id}"
+        _wait_for_disconnect(request), name=f"disconnect:{label}"
     )
 
     async def abandon() -> None:
@@ -211,7 +286,7 @@ async def _acquire_lease(
             return acquire_task.result()
 
         await abandon()
-        logger.info("client disconnected while waiting for model %s", model_id)
+        logger.info("client disconnected while waiting for %s", label)
         return None
     except asyncio.CancelledError:
         # Server-side cancellation (shutdown, middleware) rather than a client
@@ -293,6 +368,41 @@ async def _run_inference(
     return await asyncio.shield(task)
 
 
+async def _run_dual_inference(
+    current_lease: ModelLease,
+    candidate_lease: ModelLease,
+    features: np.ndarray,
+    delay_seconds: float,
+    pending: set[asyncio.Task[Any]],
+) -> tuple[tuple[float, bool], tuple[float, bool]]:
+    """Score one feature vector with both weight versions.
+
+    Both legs run as detached, shielded tasks.  A client disconnect (or any
+    request cancellation) therefore cannot produce a half result in the
+    cache: once the comparison has started, both computations run to the end
+    and each task releases its own lease only when its thread finishes.
+    """
+
+    current_task = asyncio.create_task(
+        _execute_inference(current_lease, features, delay_seconds),
+        name="inference:current",
+    )
+    candidate_task = asyncio.create_task(
+        _execute_inference(candidate_lease, features, delay_seconds),
+        name="inference:candidate",
+    )
+    pending.update({current_task, candidate_task})
+
+    def _done(finished: asyncio.Task[Any]) -> None:
+        pending.discard(finished)
+        _consume_task_result(finished)
+
+    current_task.add_done_callback(_done)
+    candidate_task.add_done_callback(_done)
+
+    return await asyncio.shield(current_task), await asyncio.shield(candidate_task)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -302,10 +412,20 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         active_settings = settings or load_settings()
         active_manifest = manifest or load_manifest(active_settings.model_dir)
+
+        # The catalog is re-read on every comparison request, so candidate
+        # artifacts published into the mounted directory take effect without a
+        # restart.  An absent or invalid directory is tolerated at startup:
+        # production inference stays available and comparison calls report the
+        # failure as a model_load_failed response.
+        def candidate_catalog_provider() -> CandidateCatalog:
+            return load_candidate_catalog(active_settings.candidate_model_dir)
+
         cache = ModelCache(
             active_manifest,
             active_settings.model_budget_bytes,
             active_settings.model_load_delay_seconds,
+            candidate_catalog_provider=candidate_catalog_provider,
         )
         app.state.settings = active_settings
         app.state.cache = cache
@@ -331,7 +451,9 @@ def create_app(
         title="Device Anomaly Inference API",
         description=(
             "按设备型号提交振动与电流测值，按需装载固定权重逻辑回归模型并返回异常分数。\n\n"
-            "模型权重按需驻留，驻留与装载预留合计不超预算；空间不足且无空闲模型时返回 503。"
+            "模型权重按需驻留，驻留与装载预留合计不超预算；空间不足且无空闲模型时返回 503。\n"
+            "`/v1/compare` 用同一段测值对照独立候选目录中的候选权重，候选与现行权重共用同一字节预算，"
+            "且候选永远不会驱逐现行模型。"
         ),
         version="1.0.0",
         lifespan=lifespan,
@@ -380,7 +502,12 @@ def create_app(
             )
 
         try:
-            lease = await _acquire_lease(cache, payload.model_id, request)
+            lease = await _acquire_lease(
+                cache,
+                f"model:{payload.model_id}",
+                lambda: cache.acquire(payload.model_id),
+                request,
+            )
         except ModelCacheError as exc:
             return _cache_error_response(exc)
 
@@ -418,6 +545,138 @@ def create_app(
             anomaly_score=score,
             is_anomaly=is_anomaly,
             decision_threshold=model.decision_threshold,
+            features={
+                name: float(value)
+                for name, value in zip(FEATURE_NAMES, features, strict=True)
+            },
+        )
+
+    @app.post(
+        "/v1/compare",
+        response_model=ComparisonResponse,
+        summary="Compare current weights with a candidate version on one measurement window",
+        description=(
+            "用同一段振动、电流测值同时计算现行权重与候选权重的异常分数，"
+            "返回两个版本各自的分数、异常判定以及分数差，用于更新权重前确认巡检结论是否会改变。\n\n"
+            "候选权重只从独立候选目录读取；正式 `/v1/infer` 始终使用现行权重，不受本接口影响。"
+        ),
+        responses={
+            404: {"description": "Unknown device model or candidate version"},
+            422: {"description": "Invalid measurement payload"},
+            500: {"description": "Candidate load or inference failure"},
+            503: {"description": "Not enough free budget to hold the candidate; retry later"},
+            507: {"description": "Candidate weights cannot fit into the configured budget"},
+        },
+        tags=["inference"],
+    )
+    async def compare(
+        payload: CompareRequest,
+        request: Request,
+        cache: ModelCache = Depends(get_cache),
+    ) -> ComparisonResponse | JSONResponse:
+        try:
+            features = extract_features(payload.vibration, payload.current)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content=_error_payload("invalid_measurement", str(exc)),
+            )
+
+        # Acquire the production lease first: formal inference is the primary
+        # workload, and resolving the model id here also yields the 404 for an
+        # unknown device model before any candidate budget is touched.
+        try:
+            current_lease = await _acquire_lease(
+                cache,
+                f"model:{payload.model_id}",
+                lambda: cache.acquire(payload.model_id),
+                request,
+            )
+        except ModelCacheError as exc:
+            return _cache_error_response(exc)
+        if current_lease is None:
+            return JSONResponse(
+                status_code=499,
+                content=_error_payload(
+                    "client_disconnected",
+                    "client disconnected while waiting for the current model",
+                ),
+            )
+
+        # If the client goes away while waiting for the candidate, the current
+        # lease is released explicitly below; nothing has been scored yet, so a
+        # partial comparison result can never exist.
+        try:
+            candidate_lease = await _acquire_lease(
+                cache,
+                f"candidate:{payload.model_id}:{payload.candidate_version}",
+                lambda: cache.acquire_candidate(
+                    payload.model_id, payload.candidate_version
+                ),
+                request,
+            )
+        except ModelCacheError as exc:
+            await current_lease.release()
+            return _cache_error_response(exc)
+
+        if candidate_lease is None:
+            await current_lease.release()
+            return JSONResponse(
+                status_code=499,
+                content=_error_payload(
+                    "client_disconnected",
+                    "client disconnected while waiting for the candidate model",
+                ),
+            )
+
+        delay = request.app.state.settings.inference_delay_seconds
+        try:
+            # Both legs are detached and shielded: a disconnect after this
+            # point lets the request return, but the two computations finish
+            # and release their leases themselves — never a half result.
+            (
+                (current_score, current_anomaly),
+                (candidate_score, candidate_anomaly),
+            ) = await _run_dual_inference(
+                current_lease,
+                candidate_lease,
+                features,
+                delay,
+                request.app.state.pending_inferences,
+            )
+        except ModelCacheError as exc:
+            return _cache_error_response(exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "comparison failed for model %s candidate %s",
+                payload.model_id,
+                payload.candidate_version,
+            )
+            return _cache_error_response(InferenceError(f"inference failed: {exc}"))
+
+        current_model = current_lease.model
+        candidate_model = candidate_lease.model
+        difference = candidate_score - current_score
+
+        return ComparisonResponse(
+            model_id=current_model.model_id,
+            model_name=current_model.name,
+            current=VersionScore(
+                model_version=current_model.version,
+                anomaly_score=current_score,
+                is_anomaly=current_anomaly,
+                decision_threshold=current_model.decision_threshold,
+            ),
+            candidate=VersionScore(
+                model_version=candidate_model.version,
+                anomaly_score=candidate_score,
+                is_anomaly=candidate_anomaly,
+                decision_threshold=candidate_model.decision_threshold,
+            ),
+            score_difference=difference,
+            decision_changed=current_anomaly != candidate_anomaly,
             features={
                 name: float(value)
                 for name, value in zip(FEATURE_NAMES, features, strict=True)

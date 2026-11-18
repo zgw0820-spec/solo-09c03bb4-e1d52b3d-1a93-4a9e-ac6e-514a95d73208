@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "candidates": [
+    {
+      "model_id": "pump",
+      "version": "1.1.0-rc1",
+      "file": "pump-1.1.0-rc1.json",
+      "weights_bytes": 296
+    },
+    {
+      "model_id": "fan",
+      "version": "1.1.0-rc1",
+      "file": "fan-1.1.0-rc1.json",
+      "weights_bytes": 296
+    },
+    {
+      "model_id": "compressor",
+      "version": "1.1.0-rc1",
+      "file": "compressor-1.1.0-rc1.json",
+      "weights_bytes": 296
+    }
+  ]
+}

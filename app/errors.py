@@ -62,5 +62,18 @@ class ModelLoadError(ModelCacheError):
         self.reason = reason
 
 
+class UnknownCandidateError(ModelCacheError):
+    """The requested candidate version is not published in the candidate directory."""
+
+    code = "unknown_candidate"
+
+    def __init__(self, model_id: str, candidate_version: str) -> None:
+        super().__init__(
+            f"unknown candidate version {candidate_version!r} for model {model_id}"
+        )
+        self.model_id = model_id
+        self.candidate_version = candidate_version
+
+
 class InferenceError(ModelCacheError):
     code = "inference_failed"

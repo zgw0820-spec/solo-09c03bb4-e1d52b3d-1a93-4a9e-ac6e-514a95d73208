@@ -16,6 +16,14 @@ services:
       # Simulated weight-read latency; useful for exercising concurrency.
       MODEL_LOAD_DELAY_MS: "${MODEL_LOAD_DELAY_MS:-0}"
       MODEL_DIR: "/srv/models"
+      # Independent candidate-weight directory used only by POST /v1/compare.
+      # It is bind-mounted from the host so new candidate versions can be
+      # published without rebuilding the image.
+      CANDIDATE_MODEL_DIR: "/srv/candidate_models"
+    volumes:
+      # Production weights stay baked into the image; candidate weights are
+      # mounted independently and never back /v1/infer.
+      - ./candidate_models:/srv/candidate_models:ro
     read_only: true
     tmpfs:
       - /tmp

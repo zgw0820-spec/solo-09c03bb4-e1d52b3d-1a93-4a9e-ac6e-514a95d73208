@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
+DEFAULT_CANDIDATE_DIR = Path(__file__).resolve().parents[1] / "candidate_models"
 
 
 class ConfigurationError(RuntimeError):
@@ -42,6 +43,7 @@ class Settings:
     """
 
     model_dir: Path
+    candidate_model_dir: Path
     model_budget_bytes: int
     inference_delay_ms: int
     model_load_delay_ms: int
@@ -59,8 +61,16 @@ def load_settings() -> Settings:
     model_dir_raw = os.getenv("MODEL_DIR")
     model_dir = Path(model_dir_raw).expanduser().resolve() if model_dir_raw else DEFAULT_MODEL_DIR
 
+    candidate_dir_raw = os.getenv("CANDIDATE_MODEL_DIR")
+    candidate_model_dir = (
+        Path(candidate_dir_raw).expanduser().resolve()
+        if candidate_dir_raw
+        else DEFAULT_CANDIDATE_DIR
+    )
+
     return Settings(
         model_dir=model_dir,
+        candidate_model_dir=candidate_model_dir,
         model_budget_bytes=_read_int("MODEL_CACHE_BYTES", 640, minimum=1),
         inference_delay_ms=_read_int("INFERENCE_DELAY_MS", 250, minimum=0),
         model_load_delay_ms=_read_int("MODEL_LOAD_DELAY_MS", 0, minimum=0),

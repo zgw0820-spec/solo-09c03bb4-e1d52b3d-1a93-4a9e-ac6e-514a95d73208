@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY models ./models
+COPY candidate_models ./candidate_models
 COPY scripts ./scripts
 
 RUN useradd --create-home --uid 10001 appuser \
